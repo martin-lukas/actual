@@ -2,6 +2,8 @@ import { initBackend as initSQLBackend } from 'absurd-sql/dist/indexeddb-main-th
 
 import { logger } from '#platform/server/log';
 
+import { debugLog, recordWatchdogReload, updateOverlay } from './debug-overlay';
+
 // After sending a __resume-tab ping we wait for any response from the shared worker.
 // A live shared worker replies well below this threshold; no response means
 // it might have been killed by the OS, and we need to reload.
@@ -52,6 +54,10 @@ export class WorkerBridge {
 
     this._onVisibilityChange = () => {
       if (document.visibilityState === 'hidden' || !this._started) {
+        debugLog('visibilitychange-ignored', {
+          hidden: document.visibilityState === 'hidden',
+          started: this._started,
+        });
         return;
       }
 
@@ -59,11 +65,20 @@ export class WorkerBridge {
       this._sharedWorkerLivenessTimeout.clear();
       this._resumeAssociation();
       this._sharedWorkerLivenessTimeout.start();
+      debugLog('visibilitychange-resume-check');
     };
 
     // Listen for all messages from the SharedWorker port
     sharedPort.addEventListener('message', e => this._onSharedMessage(e));
     document.addEventListener('visibilitychange', this._onVisibilityChange);
+
+    updateOverlay({
+      role: 'UNASSIGNED',
+      budgetId: null,
+      started: false,
+      watchdogArmed: false,
+    });
+    debugLog('bridge-created');
   }
 
   set onmessage(handler: ((e: MessageEvent) => void) | null) {
@@ -73,6 +88,8 @@ export class WorkerBridge {
     if (!this._started) {
       this._started = true;
       this._sharedPort.start();
+      updateOverlay({ started: true });
+      debugLog('port-started', { via: 'onmessage-setter' });
     }
   }
 
@@ -94,6 +111,8 @@ export class WorkerBridge {
     if (!this._started) {
       this._started = true;
       this._sharedPort.start();
+      updateOverlay({ started: true });
+      debugLog('port-started', { via: 'start()' });
     }
   }
 
@@ -116,6 +135,11 @@ export class WorkerBridge {
     this._sharedWorkerLivenessTimeout.clear();
 
     const msg = event.data as BridgeMessage;
+    updateOverlay({
+      lastSharedMessageAt: Date.now(),
+      lastMessageType: msg?.type ?? null,
+      watchdogArmed: false,
+    });
 
     // Elected as leader: create the real backend Worker on this tab
     if (msg && msg.type === '__become-leader') {
@@ -209,6 +233,7 @@ export class WorkerBridge {
     if (role !== 'LEADER') {
       this._terminateLocalBackendWorker();
     }
+    updateOverlay({ role, budgetId: this._currentBudgetId });
   }
 
   _resumeAssociation() {
@@ -216,6 +241,8 @@ export class WorkerBridge {
       type: '__resume-tab',
       budgetId: this._currentBudgetId,
     });
+    updateOverlay({ lastResumeSentAt: Date.now() });
+    debugLog('resume-tab-sent', { budgetId: this._currentBudgetId });
   }
 
   _createLocalWorker(
@@ -278,7 +305,10 @@ export class WorkerBridge {
     let timer: ReturnType<typeof setTimeout> | null = null;
     return {
       start() {
+        updateOverlay({ watchdogArmed: true });
         timer = setTimeout(() => {
+          debugLog('watchdog-fired-reloading');
+          recordWatchdogReload();
           window.location.reload();
         }, RESUME_TAB_RESPONSE_TIMEOUT_MS);
       },
@@ -286,6 +316,7 @@ export class WorkerBridge {
         if (timer !== null) {
           clearTimeout(timer);
           timer = null;
+          updateOverlay({ watchdogArmed: false });
         }
       },
     };
